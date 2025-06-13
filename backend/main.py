@@ -1,29 +1,31 @@
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import recommand_news
-from fastapi import FastAPI,Query
-from fastapi.middleware.cors import CORSMiddleware
+from sentence_transformers import SentenceTransformer, util
+import torch
 
-# 1. 앱 초기화
+# 앱 초기화
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# 2. 데이터 로드 & 벡터화
+
+# 데이터 로드 및 전처리
 df = pd.read_csv("news_data.csv")
-df['content'] = df['title'] + " " + df['summary']
+df['content'] = df['title'] + " " + df['summary'].str.lower()
 
-vectorizer = TfidfVectorizer()
-tfidf_matrix = vectorizer.fit_transform(df['content'])
+# BERT 기반 임베딩 모델 로드
+model = SentenceTransformer("jhgan/ko-sbert-nli")
+corpus_embeddings = model.encode(df['content'].tolist(), convert_to_tensor=True)
 
-def recommend_news(input_title, top_n=3):
+# 뉴스 추천 함수
+def recommend_news(input_title: str):
     if not input_title.strip():
         return pd.DataFrame([{
             "title": "입력된 제목이 비어 있거나 유효하지 않습니다",
@@ -31,44 +33,33 @@ def recommend_news(input_title, top_n=3):
             "url": "#"
         }])
 
-    input_vec = vectorizer.transform([input_title])
-
-    if input_vec.nnz == 0:
-        print(f"[로그] 입력 '{input_title}' → 희소 벡터. 관련 뉴스 없음.")
-        return pd.DataFrame([{
-            "title": "관련 뉴스가 없습니다",
-            "summary": "입력하신 키워드와 유사한 뉴스가 존재하지 않아요.",
-            "url": "#"
-        }])
-
-    similarities = cosine_similarity(input_vec, tfidf_matrix).flatten()
+    # 입력 문장 임베딩
+    input_embedding = model.encode([input_title], convert_to_tensor=True)
+    cosine_scores = util.cos_sim(input_embedding, corpus_embeddings)[0]
 
     print(f"\n[ 유사도 로그] 입력: '{input_title}'")
     scored_news = []
-    for i, sim in enumerate(similarities):
+    for i, sim in enumerate(cosine_scores):
         print(f"- {df.iloc[i]['title']}: {sim:.4f}")
-        if sim > 0:
-            scored_news.append((i, sim))
+        if sim.item() > 0.251:  # 유사도 필터링 기준
+            scored_news.append((i, sim.item()))
 
     if not scored_news:
         return pd.DataFrame([{
             "title": "관련 뉴스가 없습니다",
-            "summary": "유사도가 0인 뉴스는 제외되었어요.",
+            "summary": "입력하신 키워드와 관련된 뉴스가 충분하지 않아요.",
             "url": "#"
         }])
 
-    # 유사도 순으로 정렬한 뒤 전부 반환
+    # 유사도 내림차순 정렬 후 상위 5개 추출
     sorted_indices = sorted(scored_news, key=lambda x: x[1], reverse=True)
-    selected_indices = [i for i, _ in sorted_indices]
+    top_indices = [i for i, _ in sorted_indices[:5]]  # 상위 5개만
 
-    print("[ 추천 결과]", df.iloc[selected_indices]['title'].tolist())
-
-    return df.iloc[selected_indices][['title', 'summary', 'url']]
-
+    print("[ 추천 결과]", df.iloc[top_indices]['title'].tolist())
+    return df.iloc[top_indices][['title', 'summary', 'url']]
 
 
-
-# 4. API 라우터
+# API 라우터
 @app.get("/recommend")
 def get_recommendation(title: str = Query(..., description="뉴스 제목")):
     try:
